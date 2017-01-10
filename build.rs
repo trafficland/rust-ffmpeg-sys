@@ -50,6 +50,30 @@ fn fetch() -> io::Result<()> {
 	}
 }
 
+fn patch() -> io::Result<()> {
+	let root = env::var("CARGO_MANIFEST_DIR").unwrap();
+
+	let apply_patch = |patch: &str| {
+		let status = try!(
+			Command::new("patch")
+				.current_dir(&source())
+				.arg("-p1")
+				.arg("-i")
+				.arg(format!("{}/{}", root, patch))
+				.status()
+		);
+
+		if status.success() {
+			Ok(())
+		} else {
+			Err(io::Error::new(io::ErrorKind::Other, format!("patch {} failed", patch)))
+		}
+	};
+
+	let patches: Vec<&str> = vec!["discard_invalid_rtcp.patch"];
+	patches.into_iter().fold(Ok(()), |acc, patch| acc.and(apply_patch(&patch)))
+}
+
 fn build() -> io::Result<()> {
 	let mut configure = Command::new("./configure");
 	configure.current_dir(&source());
@@ -333,6 +357,7 @@ fn main() {
 		if fs::metadata(&search().join("lib").join("libavutil.a")).is_err() {
 			fs::create_dir_all(&output()).ok().expect("failed to create build directory");
 			fetch().unwrap();
+			patch().unwrap();
 			build().unwrap();
 		}
 
