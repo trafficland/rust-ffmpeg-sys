@@ -58,6 +58,9 @@ pub struct AVClass {
 	pub query_ranges: extern fn(ranges: *mut *mut AVOptionRanges, obj: *mut c_void, key: *const c_char, flags: c_int) -> c_int,
 }
 
+#[repr(C)]
+pub struct VaList(*mut c_void);
+
 pub const AV_LOG_QUIET:      c_int = -8;
 pub const AV_LOG_PANIC:      c_int = 0;
 pub const AV_LOG_FATAL:      c_int = 8;
@@ -82,11 +85,11 @@ extern {
 	//pub fn av_vlog(avcl: *mut c_void, level: c_int, fmt: *const c_char, vl: va_list);
 	pub fn av_log_get_level() -> c_int;
 	pub fn av_log_set_level(level: c_int);
-	//pub fn av_log_set_callback(callback: extern fn(*mut c_void, c_int, *const c_char, va_list));
+	pub fn av_log_set_callback(callback: extern fn(*mut c_void, c_int, *const c_char, VaList));
 	//pub fn av_log_default_callback(avcl: *mut c_void, level: c_int, fmt: *const c_char, vl: va_list);
 	pub fn av_default_item_name(ctx: *mut c_void) -> *const c_char;
 	pub fn av_default_get_category(ptr: *mut c_void) -> AVClassCategory;
-	//pub fn av_log_format_line(ptr: *mut c_void, level: c_int, fmt: *const c_char, vl: va_list, line: *mut c_char, line_size: c_int, print_prefix: *mut c_int);
+	pub fn av_log_format_line(ptr: *mut c_void, level: c_int, fmt: *const c_char, vl: VaList, line: *mut c_char, line_size: c_int, print_prefix: *mut c_int);
 	pub fn av_log_set_flags(arg: c_int);
 	pub fn av_log_get_flags() -> c_int;
 }
