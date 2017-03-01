@@ -1,6 +1,6 @@
 [package]
 name    = "ffmpeg-sys"
-version = "2.8.7"
+version = "3.2.4"
 build   = "build.rs"
 links   = "ffmpeg"
 
@@ -15,7 +15,9 @@ keywords    = ["audio", "video"]
 libc = "0.2"
 
 [build-dependencies]
-num_cpus = "0.2.11"
+num_cpus   = "1"
+gcc        = "0.3"
+pkg-config = "0.3"
 
 [features]
 default  = ["avcodec", "avdevice", "avfilter", "avformat", "avresample", "swresample", "swscale"]
@@ -29,8 +31,9 @@ build-license-nonfree  = ["build"]
 build-license-version3 = ["build"]
 
 # misc
-build-pic  = ["build"]
-build-zlib = ["build"]
+build-nvenc = ["build"]
+build-pic   = ["build"]
+build-zlib  = ["build"]
 
 # ssl
 build-lib-gnutls  = ["build"]

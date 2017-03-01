@@ -1,8 +1,10 @@
 extern crate num_cpus;
+extern crate gcc;
+extern crate pkg_config;
 
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs::{self, create_dir, File, symlink_metadata};
+use std::io::{self, Write, BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
 use std::str;
@@ -10,14 +12,8 @@ use std::str;
 fn version() -> String {
 	let major: u8 = env::var("CARGO_PKG_VERSION_MAJOR").unwrap().parse().unwrap();
 	let minor: u8 = env::var("CARGO_PKG_VERSION_MINOR").unwrap().parse().unwrap();
-	let patch: u8 = env::var("CARGO_PKG_VERSION_PATCH").unwrap().parse().unwrap();
 
-	if patch == 0 {
-		format!("{}.{}", major, minor)
-	}
-	else {
-		format!("{}.{}.{}", major, minor, patch)
-	}
+	format!("{}.{}", major, minor)
 }
 
 fn output() -> PathBuf {
@@ -37,19 +33,14 @@ fn search() -> PathBuf {
 }
 
 fn fetch() -> io::Result<()> {
-	let url    = format!("http://ffmpeg.org/releases/ffmpeg-{}.tar.bz2", version());
-	let status = try!(if cfg!(target_os = "linux") {
-		Command::new("wget")
-			.current_dir(&output())
-			.arg(url)
-			.arg("-c")
-			.arg("-O")
-			.arg("ffmpeg.tar.bz2")
-			.status()
-	}
-	else {
-		unimplemented!();
-	});
+	let status = try!(Command::new("git")
+		.current_dir(&output())
+		.arg("clone")
+		.arg("-b")
+		.arg(format!("release/{}", version()))
+		.arg("https://github.com/FFmpeg/FFmpeg")
+		.arg(format!("ffmpeg-{}", version()))
+		.status());
 
 	if status.success() {
 		Ok(())
@@ -59,24 +50,28 @@ fn fetch() -> io::Result<()> {
 	}
 }
 
-fn extract() -> io::Result<()> {
-	let status = try!(if cfg!(target_os = "linux") {
-		Command::new("tar")
-			.current_dir(&output())
-			.arg("xf")
-			.arg("ffmpeg.tar.bz2")
-			.status()
-	}
-	else {
-		unimplemented!();
-	});
+fn patch() -> io::Result<()> {
+	let root = env::var("CARGO_MANIFEST_DIR").unwrap();
 
-	if status.success() {
-		Ok(())
-	}
-	else {
-		Err(io::Error::new(io::ErrorKind::Other, "extract failed"))
-	}
+	let apply_patch = |patch: &str| {
+		let status = try!(
+			Command::new("patch")
+				.current_dir(&source())
+				.arg("-p1")
+				.arg("-i")
+				.arg(format!("{}/{}", root, patch))
+				.status()
+		);
+
+		if status.success() {
+			Ok(())
+		} else {
+			Err(io::Error::new(io::ErrorKind::Other, format!("patch {} failed", patch)))
+		}
+	};
+
+	let patches: Vec<&str> = vec!["discard_invalid_rtcp.patch"];
+	patches.into_iter().fold(Ok(()), |acc, patch| acc.and(apply_patch(&patch)))
 }
 
 fn build() -> io::Result<()> {
@@ -92,6 +87,7 @@ fn build() -> io::Result<()> {
 	if env::var("DEBUG").is_ok() {
 		configure.arg("--enable-debug");
 		configure.arg("--disable-stripping");
+		configure.arg("--optflags='-Og'");
 	}
 	else {
 		configure.arg("--disable-debug");
@@ -101,6 +97,8 @@ fn build() -> io::Result<()> {
 	// make it static
 	configure.arg("--enable-static");
 	configure.arg("--disable-shared");
+
+	configure.arg("--enable-pic");
 
 	// do not build programs since we don't need them
 	configure.arg("--disable-programs");
@@ -199,6 +197,9 @@ fn build() -> io::Result<()> {
 	enable!(configure, "BUILD_LIB_AVS", "libavs");
 	enable!(configure, "BUILD_LIB_XVID", "libxvid");
 
+	// other external libraries
+	enable!(configure, "BUILD_NVENC", "nvenc");
+
 	// configure external protocols
 	enable!(configure, "BUILD_LIB_SMBCLIENT", "libsmbclient");
 	enable!(configure, "BUILD_LIB_SSH", "libssh");
@@ -207,8 +208,12 @@ fn build() -> io::Result<()> {
 	enable!(configure, "BUILD_PIC", "pic");
 
 	// run ./configure
-	if !try!(configure.status()).success() {
-		return Err(io::Error::new(io::ErrorKind::Other, "configure failed"));
+	let output = configure.output().expect(&format!("{:?} failed", configure));
+	if !output.status.success() {
+		println!("configure: {}", String::from_utf8_lossy(&output.stdout));
+
+		return Err(io::Error::new(io::ErrorKind::Other,
+			format!("configure failed {}", String::from_utf8_lossy(&output.stderr))));
 	}
 
 	// run make
@@ -226,7 +231,7 @@ fn build() -> io::Result<()> {
 	Ok(())
 }
 
-fn check_features(infos: &Vec<(&'static str, Option<&'static str>, &'static str)>) {
+fn check_features(include_paths: Vec<PathBuf>, infos: &Vec<(&'static str, Option<&'static str>, &'static str)>) {
 	let mut includes_code = String::new();
 	let mut main_code = String::new();
 
@@ -282,16 +287,13 @@ fn check_features(infos: &Vec<(&'static str, Option<&'static str>, &'static str)
 	"#, includes_code=includes_code, main_code=main_code).expect("Write failed");
 
 	let executable = out_dir.join(if cfg!(windows) { "check.exe" } else { "check" });
-	let compiler =
-		if cfg!(windows) || env::var("MSYSTEM").unwrap_or("".to_string()).starts_with("MINGW32") {
-			"gcc"
-		}
-		else {
-			"cc"
-		};
+	let mut compiler = gcc::Config::new().get_compiler().to_command();
 
-	if !Command::new(compiler).current_dir(&out_dir)
-		.arg("-I").arg(search().join("dist").join("include").to_string_lossy().into_owned())
+	for dir in include_paths {
+		compiler.arg("-I");
+		compiler.arg(dir.to_string_lossy().into_owned());
+	}
+	if !compiler.current_dir(&out_dir)
 		.arg("-o").arg(&executable)
 		.arg("check.c")
 		.status().expect("Command failed").success() {
@@ -333,34 +335,80 @@ fn check_features(infos: &Vec<(&'static str, Option<&'static str>, &'static str)
 				                         version_minor=version_minor,
 				                         lib=lib);
 				let pos = stdout.find(&search_str).expect("Variable not found in output") + search_str.len();
- 				if &stdout[pos..pos+1] == "1" {
- 					println!(r#"cargo:rustc-cfg=feature="{}""#, &search_str[1..(search_str.len() - 1)]);
- 				}
+
+				if &stdout[pos .. pos + 1] == "1" {
+					println!(r#"cargo:rustc-cfg=feature="{}""#, &search_str[1..(search_str.len() - 1)]);
+				}
 			}
 		}
 	}
 }
 
 fn main() {
-	if env::var("CARGO_FEATURE_BUILD").is_ok() {
+	let statik = env::var("CARGO_FEATURE_STATIC").is_ok();
+
+	let include_paths: Vec<PathBuf> = if env::var("CARGO_FEATURE_BUILD").is_ok() {
 		println!("cargo:rustc-link-search=native={}", search().join("lib").to_string_lossy());
 
 		if env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && cfg!(target_os = "linux") {
 			println!("cargo:rustc-link-lib=z");
 		}
 
-		if fs::metadata(&search().join("lib").join("libavutil.a")).is_ok() {
-			return;
+		if fs::metadata(&search().join("lib").join("libavutil.a")).is_err() {
+			fs::create_dir_all(&output()).ok().expect("failed to create build directory");
+			fetch().unwrap();
+			patch().unwrap();
+			build().unwrap();
 		}
 
-		fs::create_dir_all(&output()).ok().expect("failed to create build directory");
-		fetch().unwrap();
-		extract().unwrap();
-		build().unwrap();
+		// Check additional required libraries.
+		{
+			let config_mak = source().join("config.mak");
+			let file = File::open(config_mak).unwrap();
+			let reader = BufReader::new(file);
+			let extra_libs = reader.lines()
+				.find(|ref line| line.as_ref().unwrap().starts_with("EXTRALIBS"))
+				.map(|line| line.unwrap()).unwrap();
+
+			let linker_args = extra_libs.split('=').last().unwrap().split(' ');
+			let include_libs = linker_args.filter(|v| v.starts_with("-l")).map(|flag| &flag[2..]);
+
+			for lib in include_libs {
+				println!("cargo:rustc-link-lib={}", lib);
+			}
+		}
+
+		vec![search().join("include")]
+	}
+	// Use prebuilt library
+	else if let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") {
+		let ffmpeg_dir = PathBuf::from(ffmpeg_dir);
+
+		println!("cargo:rustc-link-search=native={}",
+				 ffmpeg_dir.join("lib").to_string_lossy());
+
+		vec![ffmpeg_dir.join("include")]
+	}
+	// Fallback to pkg-config
+	else {
+		pkg_config::Config::new()
+			.statik(statik)
+			.probe("libavcodec").unwrap().include_paths
+	};
+
+	if statik && cfg!(target_os = "macos") {
+		let frameworks = vec![
+			"AppKit", "AudioToolbox", "AVFoundation", "CoreFoundation",
+			"CoreGraphics", "CoreMedia", "CoreServices", "CoreVideo",
+			"Foundation", "OpenCL", "OpenGL", "QTKit", "QuartzCore",
+			"Security", "VideoDecodeAcceleration", "VideoToolbox"
+		];
+		for f in frameworks {
+			println!("cargo:rustc-link-lib=framework={}", f);
+		}
 	}
 
-
-	check_features(&vec![
+	check_features(include_paths.clone(), &vec![
 		("libavutil/avutil.h", None, "FF_API_OLD_AVOPTIONS"),
 
 		("libavutil/avutil.h", None, "FF_API_PIX_FMT"),
@@ -378,6 +426,9 @@ fn main() {
 		("libavutil/avutil.h", None, "FF_API_DLOG"),
 		("libavutil/avutil.h", None, "FF_API_HMAC"),
 		("libavutil/avutil.h", None, "FF_API_VAAPI"),
+		("libavutil/avutil.h", None, "FF_API_PKT_PTS"),
+		("libavutil/avutil.h", None, "FF_API_ERROR_FRAME"),
+		("libavutil/avutil.h", None, "FF_API_FRAME_QP"),
 
 		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_VIMA_DECODER"),
 		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_REQUEST_CHANNELS"),
@@ -434,15 +485,22 @@ fn main() {
 		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_WITHOUT_PREFIX"),
 		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_CONVERGENCE_DURATION"),
 		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_PRIVATE_OPT"),
+		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_CODER_TYPE"),
+		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_RTP_CALLBACK"),
+		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_STAT_BITS"),
+		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_VBV_DELAY"),
+		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_SIDEDATA_ONLY_PKT"),
+		("libavcodec/avcodec.h", Some("avcodec"), "FF_API_AVPICTURE"),
 
 		("libavformat/avformat.h", Some("avformat"), "FF_API_LAVF_BITEXACT"),
 		("libavformat/avformat.h", Some("avformat"), "FF_API_LAVF_FRAC"),
 		("libavformat/avformat.h", Some("avformat"), "FF_API_URL_FEOF"),
 		("libavformat/avformat.h", Some("avformat"), "FF_API_PROBESIZE_32"),
+		("libavformat/avformat.h", Some("avformat"), "FF_API_LAVF_AVCTX"),
+		("libavformat/avformat.h", Some("avformat"), "FF_API_OLD_OPEN_CALLBACKS"),
 
 		("libavfilter/avfilter.h", Some("avfilter"), "FF_API_AVFILTERPAD_PUBLIC"),
 		("libavfilter/avfilter.h", Some("avfilter"), "FF_API_FOO_COUNT"),
-		("libavfilter/avfilter.h", Some("avfilter"), "FF_API_AVFILTERBUFFER"),
 		("libavfilter/avfilter.h", Some("avfilter"), "FF_API_OLD_FILTER_OPTS"),
 		("libavfilter/avfilter.h", Some("avfilter"), "FF_API_OLD_FILTER_OPTS_ERROR"),
 		("libavfilter/avfilter.h", Some("avfilter"), "FF_API_AVFILTER_OPEN"),
@@ -455,4 +513,21 @@ fn main() {
 		("libswscale/swscale.h", Some("swscale"), "FF_API_SWS_CPU_CAPS"),
 		("libswscale/swscale.h", Some("swscale"), "FF_API_ARCH_BFIN"),
 	]);
+
+	let tmp = std::env::current_dir().unwrap().join("tmp");
+	if symlink_metadata(&tmp).is_err() {
+		create_dir(&tmp).expect("Failed to create temporary output dir");
+	}
+	let mut f = File::create(tmp.join(".build"))
+		.expect("Filed to create .build");
+	let tool = gcc::Config::new().get_compiler();
+	write!(f, "{}", tool.path().to_string_lossy().into_owned())
+		.expect("failed to write cmd");
+	for arg in tool.args() {
+		write!(f, " {}", arg.to_str().unwrap()).expect("failed to write arg");
+	}
+	for dir in include_paths {
+		write!(f, " -I {}", dir.to_string_lossy().into_owned())
+			.expect("failed to write incdir");
+	}
 }
