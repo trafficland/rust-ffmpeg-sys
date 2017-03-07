@@ -33,14 +33,33 @@ fn search() -> PathBuf {
 }
 
 fn fetch() -> io::Result<()> {
-	let status = try!(Command::new("git")
-		.current_dir(&output())
-		.arg("clone")
-		.arg("-b")
-		.arg(format!("release/{}", version()))
-		.arg("https://github.com/FFmpeg/FFmpeg")
-		.arg(format!("ffmpeg-{}", version()))
-		.status());
+	let ffmpeg_dir_name = format!("ffmpeg-{}", version());
+	let mut git_dir = output();
+	git_dir.push(ffmpeg_dir_name.as_str());
+
+	let git_dir_exists = git_dir.as_path().is_dir() &&
+		Command::new("git")
+			.current_dir(&git_dir)
+			.arg("status")
+			.status()?.success();
+
+	let status = if git_dir_exists {
+		Command::new("git")
+			.current_dir(git_dir)
+			.arg("checkout")
+			.arg("--force")
+			.arg(format!("release/{}", version()))
+			.status()?
+	} else {
+		Command::new("git")
+			.current_dir(&output())
+			.arg("clone")
+			.arg("-b")
+			.arg(format!("release/{}", version()))
+			.arg("https://github.com/FFmpeg/FFmpeg")
+			.arg(ffmpeg_dir_name)
+			.status()?
+	};
 
 	if status.success() {
 		Ok(())
