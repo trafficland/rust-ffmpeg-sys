@@ -1,0 +1,177 @@
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 5d827d3148..1c2b037229 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -43,6 +43,7 @@ OBJS-$(CONFIG_RTPDEC)                    += rdt.o                       \
+                                             rtpdec_h261.o               \
+                                             rtpdec_h263.o               \
+                                             rtpdec_h263_rfc2190.o       \
++                                            rtpdec_h263_nj.o            \
+                                             rtpdec_h264.o               \
+                                             rtpdec_hevc.o               \
+                                             rtpdec_ilbc.o               \
+diff --git a/libavformat/rtpdec.c b/libavformat/rtpdec.c
+index 51feeeaad3..420f9c9006 100644
+--- a/libavformat/rtpdec.c
++++ b/libavformat/rtpdec.c
+@@ -88,6 +88,7 @@ void ff_register_rtp_dynamic_payload_handlers(void)
+     ff_register_dynamic_payload_handler(&ff_h261_dynamic_handler);
+     ff_register_dynamic_payload_handler(&ff_h263_1998_dynamic_handler);
+     ff_register_dynamic_payload_handler(&ff_h263_2000_dynamic_handler);
++    ff_register_dynamic_payload_handler(&ff_h263_nj_dynamic_handler);
+     ff_register_dynamic_payload_handler(&ff_h263_rfc2190_dynamic_handler);
+     ff_register_dynamic_payload_handler(&ff_h264_dynamic_handler);
+     ff_register_dynamic_payload_handler(&ff_hevc_dynamic_handler);
+@@ -622,7 +627,7 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
+     s->ssrc = ssrc;
+ 
+     /* NOTE: we can handle only one payload type */
+-    if (s->payload_type != payload_type)
++    if (s->payload_type != payload_type && s->handler != &ff_h263_nj_dynamic_handler)
+         return -1;
+ 
+     st = s->st;
+diff --git a/libavformat/rtpdec_formats.h b/libavformat/rtpdec_formats.h
+index 3292a3d265..c7d05faf41 100644
+--- a/libavformat/rtpdec_formats.h
++++ b/libavformat/rtpdec_formats.h
+@@ -62,8 +62,9 @@ extern RTPDynamicProtocolHandler ff_g726le_40_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_h261_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_h263_1998_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_h263_2000_dynamic_handler;
++extern RTPDynamicProtocolHandler ff_h263_nj_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_h263_rfc2190_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_h264_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_hevc_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_ilbc_dynamic_handler;
+ extern RTPDynamicProtocolHandler ff_jpeg_dynamic_handler;
+diff --git a/libavformat/rtpdec_h263_nj.c b/libavformat/rtpdec_h263_nj.c
+index e69de29bb2..63f2b8df36 100644
+--- a/libavformat/rtpdec_h263_nj.c
++++ b/libavformat/rtpdec_h263_nj.c
+@@ -0,0 +1,125 @@
++/*
++ * RTP H.263 Depacketizer, special flavor cooked up by Verint with lots of hallucinogens
++ * Copyright (c) 2010 Martin Storsjo
++ * Copyright (c) 2018 Ryan Bair
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "avformat.h"
++#include "avio_internal.h"
++#include "rtpdec_formats.h"
++#include "libavutil/attributes.h"
++#include "libavutil/intreadwrite.h"
++
++struct PayloadContext {
++    AVIOContext *buf;
++    uint32_t     timestamp;
++};
++
++static void h263_nj_close_context(PayloadContext *data)
++{
++    ffio_free_dyn_buf(&data->buf);
++}
++
++static int ff_h263_nj_handle_packet(AVFormatContext *ctx, PayloadContext *data,
++                            AVStream *st, AVPacket *pkt, uint32_t *timestamp,
++                            const uint8_t *buf, int len, uint16_t seq, int flags)
++{
++    uint16_t header;
++    int ret, startcode = 0, vrc, picture_header;
++
++    if (len < 2) {
++        av_log(ctx, AV_LOG_ERROR, "Too short H.263 RTP packet\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (data->buf && data->timestamp != *timestamp) {
++        /* Dropping old buffered, unfinished data */
++        ffio_free_dyn_buf(&data->buf);
++        data->timestamp = *timestamp;
++    }
++
++    if (!data->buf) {
++        /* Decode the 16 bit H.263+ payload header, as described in section
++         * 5.1 of RFC 4629. The fields of this header are:
++         * - 5 reserved bits, should be ignored.
++         * - One bit (P, startcode), indicating a picture start, picture segment
++         *   start or video sequence end. If set, two zero bytes should be
++         *   prepended to the payload.
++         * - One bit (V, vrc), indicating the presence of an 8 bit Video
++         *   Redundancy Coding field after this 16 bit header.
++         * - 6 bits (PLEN, picture_header), the length (in bytes) of an extra
++         *   picture header, following the VRC field.
++         * - 3 bits (PEBIT), the number of bits to ignore of the last byte
++         *   of the extra picture header. (Not used at the moment.)
++         */
++        header = AV_RB16(buf);
++        startcode      = (header & 0x0400) >> 9;
++        vrc            =  header & 0x0200;
++        picture_header = (header & 0x01f8) >> 3;
++        buf += 2;
++        len -= 2;
++
++        if (vrc) {
++            /* Skip VRC header if present, not used at the moment. */
++            buf += 1;
++            len -= 1;
++        }
++        if (picture_header) {
++            /* Skip extra picture header if present, not used at the moment. */
++            buf += picture_header;
++            len -= picture_header;
++        }
++    }
++
++    if (len < 0) {
++        av_log(ctx, AV_LOG_ERROR, "Too short H.263 RTP packet\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (!data->buf) {
++        ret = avio_open_dyn_buf(&data->buf);
++        if (ret < 0)
++            return ret;
++        if (startcode) {
++            avio_w8(data->buf, 0);
++            avio_w8(data->buf, 0);
++        }
++    }
++
++    avio_write(data->buf, buf, len);
++
++    if (flags & RTP_FLAG_MARKER) {
++        ret = ff_rtp_finalize_packet(pkt, &data->buf, st->index);
++        if (ret < 0)
++            return ret;
++        return 0;
++    } else {
++        return AVERROR(EAGAIN);
++    }
++}
++
++RTPDynamicProtocolHandler ff_h263_nj_dynamic_handler = {
++    .enc_name         = "H263-NJ",
++    .codec_type       = AVMEDIA_TYPE_VIDEO,
++    .codec_id         = AV_CODEC_ID_H263,
++    .need_parsing     = AVSTREAM_PARSE_FULL,
++    .parse_packet     = ff_h263_nj_handle_packet,
++    .priv_data_size   = sizeof(PayloadContext),
++    .close            = h263_nj_close_context,
++};
