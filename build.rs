@@ -89,7 +89,7 @@ fn patch() -> io::Result<()> {
 		}
 	};
 
-	let patches: Vec<&str> = vec!["discard_invalid_rtcp.patch"];
+	let patches: Vec<&str> = vec!["discard_invalid_rtcp.patch", "nj_h263_dynamic_handler.patch"];
 	patches.into_iter().fold(Ok(()), |acc, patch| acc.and(apply_patch(&patch)))
 }
 
