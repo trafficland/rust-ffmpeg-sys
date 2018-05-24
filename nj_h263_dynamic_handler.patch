@@ -103,10 +103,10 @@ index e69de29bb2..63f2b8df36 100644
 +    if (data->buf && data->timestamp != *timestamp) {
 +        /* Dropping old buffered, unfinished data */
 +        ffio_free_dyn_buf(&data->buf);
-+        data->timestamp = *timestamp;
 +    }
 +
 +    if (!data->buf) {
++        data->timestamp = *timestamp;
 +        /* Decode the 16 bit H.263+ payload header, as described in section
 +         * 5.1 of RFC 4629. The fields of this header are:
 +         * - 5 reserved bits, should be ignored.
